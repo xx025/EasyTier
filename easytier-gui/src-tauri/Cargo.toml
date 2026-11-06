@@ -51,6 +51,9 @@ url = { version = "2.5", features = ["serde"] }
 windows = { version = "0.52", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 winapi = { version = "0.3.9", features = ["securitybaseapi", "processthreadsapi"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3.6", default-features = false, features = ["async-io", "blocking"] }
+
 [target.'cfg(target_family = "unix")'.dependencies]
 libc = "0.2"
 

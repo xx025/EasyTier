@@ -23,21 +23,23 @@ impl Command {
     /// excuting the command with escalated privileges, and return the output
     pub fn output(&self) -> Result<Output> {
         let mut command = StdCommand::new("pkexec");
-        let display = env::var("DISPLAY");
-        let xauthority = env::var("XAUTHORITY");
-        let home = env::var("HOME");
+        let inherited_env = [
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "XAUTHORITY",
+            "HOME",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+        ]
+        .into_iter()
+        .filter_map(|key| env::var(key).ok().map(|value| (key, value)))
+        .collect::<Vec<_>>();
 
         command.arg("--disable-internal-agent");
-        if display.is_ok() || xauthority.is_ok() || home.is_ok() {
+        if !inherited_env.is_empty() {
             command.arg("env");
-            if let Ok(display) = display {
-                command.arg(format!("DISPLAY={}", display));
-            }
-            if let Ok(xauthority) = xauthority {
-                command.arg(format!("XAUTHORITY={}", xauthority));
-            }
-            if let Ok(home) = home {
-                command.arg(format!("HOME={}", home));
+            for (key, value) in inherited_env {
+                command.arg(format!("{key}={value}"));
             }
         } else if self.cmd.get_envs().any(|(_, v)| v.is_some()) {
             command.arg("env");

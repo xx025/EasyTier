@@ -30,13 +30,18 @@ use easytier::{
 };
 use std::ops::Deref;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, RwLock, RwLockReadGuard};
 use uuid::Uuid;
 
 use tauri::{AppHandle, Emitter, Manager as _};
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+#[cfg(target_os = "linux")]
+use ksni::blocking::TrayMethods as _;
 
 static INSTANCE_MANAGER: once_cell::sync::Lazy<RwLock<Option<Arc<NetworkInstanceManager>>>> =
     once_cell::sync::Lazy::new(|| RwLock::new(None));
@@ -65,6 +70,9 @@ static RPC_SERVER: once_cell::sync::Lazy<Mutex<Option<RpcServer>>> =
 
 static WEB_CLIENT: once_cell::sync::Lazy<RwLock<Option<WebClient>>> =
     once_cell::sync::Lazy::new(|| RwLock::new(None));
+
+#[cfg(target_os = "linux")]
+static LINUX_TRAY_AVAILABLE: AtomicBool = AtomicBool::new(false);
 
 macro_rules! get_client_manager {
     () => {{
@@ -547,6 +555,167 @@ async fn get_log_dir_path(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 #[cfg(not(target_os = "android"))]
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        let _ = set_dock_visibility(app.clone(), true);
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxTray {
+    socket_path: std::path::PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl ksni::Tray for LinuxTray {
+    fn id(&self) -> String {
+        "easytier-gui".into()
+    }
+
+    fn title(&self) -> String {
+        "EasyTier".into()
+    }
+
+    fn icon_name(&self) -> String {
+        "easytier-gui".into()
+    }
+
+    fn activate(&mut self, _x: i32, _y: i32) {
+        send_linux_tray_command(&self.socket_path, b"show");
+    }
+
+    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::menu::StandardItem;
+
+        vec![
+            StandardItem {
+                label: "Show".into(),
+                activate: Box::new(|tray: &mut Self| {
+                    send_linux_tray_command(&tray.socket_path, b"show")
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "Hide".into(),
+                activate: Box::new(|tray: &mut Self| {
+                    send_linux_tray_command(&tray.socket_path, b"hide")
+                }),
+                ..Default::default()
+            }
+            .into(),
+            ksni::MenuItem::Separator,
+            StandardItem {
+                label: "Exit".into(),
+                icon_name: "application-exit".into(),
+                activate: Box::new(|tray: &mut Self| {
+                    send_linux_tray_command(&tray.socket_path, b"exit")
+                }),
+                ..Default::default()
+            }
+            .into(),
+        ]
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn send_linux_tray_command(socket_path: &std::path::Path, command: &[u8]) {
+    use std::os::unix::net::UnixDatagram;
+
+    if let Ok(socket) = UnixDatagram::unbound() {
+        let _ = socket.send_to(command, socket_path);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn start_linux_tray_command_listener(app: tauri::AppHandle) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixDatagram;
+
+    let Some(socket_path) = std::env::var_os("EASYTIER_GUI_TRAY_SOCKET").map(std::path::PathBuf::from)
+    else {
+        return false;
+    };
+
+    let socket = match UnixDatagram::bind(&socket_path) {
+        Ok(socket) => socket,
+        Err(error) => {
+            eprintln!("Failed to create EasyTier tray command socket: {error}");
+            return false;
+        }
+    };
+
+    // The GUI is elevated, while the tray belongs to the desktop user. Allow that
+    // user process to send commands to this root-owned Unix datagram socket.
+    if let Err(error) = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o622))
+    {
+        eprintln!("Failed to set EasyTier tray command socket permissions: {error}");
+        let _ = std::fs::remove_file(&socket_path);
+        return false;
+    }
+
+    std::thread::spawn(move || {
+        let mut command = [0_u8; 16];
+        while let Ok(length) = socket.recv(&mut command) {
+            match &command[..length] {
+                b"show" => show_main_window(&app),
+                b"hide" => {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.hide();
+                    }
+                }
+                b"exit" => {
+                    app.exit(0);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let _ = std::fs::remove_file(socket_path);
+    });
+
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_elevated_with_tray() -> std::process::ExitCode {
+    let socket_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let socket_path = socket_dir.join(format!(
+        "easytier-gui-tray-{}-{}.sock",
+        unsafe { libc::getuid() },
+        std::process::id()
+    ));
+
+    let tray_handle = LinuxTray {
+        socket_path: socket_path.clone(),
+    }
+    .assume_sni_available(true)
+    .spawn();
+
+    if let Err(error) = &tray_handle {
+        eprintln!("Failed to create Linux tray icon: {error}");
+    }
+
+    let exe_path = get_exe_path();
+    let mut command = std::process::Command::new(exe_path);
+    command.env("EASYTIER_GUI_TRAY_SOCKET", &socket_path);
+
+    if let Err(error) = elevate::Command::new(command).output() {
+        eprintln!("Failed to launch elevated EasyTier GUI: {error}");
+        return std::process::ExitCode::FAILURE;
+    }
+
+    // Keep the status notifier handle alive until the elevated GUI exits.
+    drop(tray_handle);
+    std::process::ExitCode::SUCCESS
+}
+
+#[cfg(all(not(target_os = "android"), not(target_os = "linux")))]
 fn toggle_window_visibility(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let visible = window.is_visible().unwrap_or_default();
@@ -555,16 +724,7 @@ fn toggle_window_visibility(app: &tauri::AppHandle) {
 
         let should_show = !visible || minimized || !focused;
         if should_show {
-            if !visible {
-                let _ = window.show();
-            }
-            if minimized {
-                let _ = window.unminimize();
-            }
-            if !focused {
-                let _ = window.set_focus();
-            }
-            let _ = set_dock_visibility(app.clone(), true);
+            show_main_window(app);
         } else {
             let _ = window.hide();
             let _ = set_dock_visibility(app.clone(), false);
@@ -583,7 +743,7 @@ fn get_exe_path() -> String {
         .unwrap_or_default()
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(all(not(target_os = "android"), not(target_os = "linux")))]
 fn check_sudo() -> bool {
     let is_elevated = elevate::Command::is_elevated();
     if !is_elevated {
@@ -1291,7 +1451,12 @@ mod service {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run_gui() -> std::process::ExitCode {
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "linux")]
+    if !elevate::Command::is_elevated() {
+        return run_linux_elevated_with_tray();
+    }
+
+    #[cfg(all(not(target_os = "android"), not(target_os = "linux")))]
     if !check_sudo() {
         use std::process;
         process::exit(0);
@@ -1304,12 +1469,7 @@ pub fn run_gui() -> std::process::ExitCode {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            app.webview_windows()
-                .values()
-                .next()
-                .expect("Sorry, no window found")
-                .set_focus()
-                .expect("Can't Bring Window to Focus");
+            show_main_window(app);
         }));
     }
 
@@ -1341,7 +1501,7 @@ pub fn run_gui() -> std::process::ExitCode {
             };
 
             // for tray icon, menu need to be built in js
-            #[cfg(not(target_os = "android"))]
+            #[cfg(not(any(target_os = "android", target_os = "linux")))]
             let _tray_menu = TrayIconBuilder::with_id("main")
                 .show_menu_on_left_click(false)
                 .on_tray_icon_event(|tray, event| {
@@ -1360,6 +1520,12 @@ pub fn run_gui() -> std::process::ExitCode {
                 ))?)
                 .icon_as_template(true)
                 .build(app)?;
+
+            #[cfg(target_os = "linux")]
+            {
+                let tray_available = start_linux_tray_command_listener(app.handle().clone());
+                LINUX_TRAY_AVAILABLE.store(tray_available, Ordering::Relaxed);
+            }
 
             Ok(())
         })
@@ -1390,7 +1556,17 @@ pub fn run_gui() -> std::process::ExitCode {
             get_log_dir_path,
         ])
         .on_window_event(|_win, event| match event {
-            #[cfg(not(target_os = "android"))]
+            #[cfg(target_os = "linux")]
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                if LINUX_TRAY_AVAILABLE.load(Ordering::Relaxed) {
+                    let _ = _win.hide();
+                } else {
+                    // Keep the window recoverable if the desktop has no tray service.
+                    let _ = _win.minimize();
+                }
+                api.prevent_close();
+            }
+            #[cfg(all(not(target_os = "android"), not(target_os = "linux")))]
             tauri::WindowEvent::CloseRequested { api, .. } => {
                 let _ = _win.hide();
                 let _ = set_dock_visibility(_win.app_handle().clone(), false);
