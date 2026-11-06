@@ -631,6 +631,62 @@ fn send_linux_tray_command(socket_path: &std::path::Path, command: &[u8]) {
 }
 
 #[cfg(target_os = "linux")]
+fn linux_desktop_theme() -> &'static str {
+    let output = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "color-scheme"])
+        .output();
+
+    match output {
+        Ok(output) if String::from_utf8_lossy(&output.stdout).contains("prefer-dark") => "dark",
+        _ => "light",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_linux_window_theme(app: &tauri::AppHandle, theme: &[u8]) {
+    let theme = match theme {
+        b"dark" | b"theme-dark" => Some(tauri::Theme::Dark),
+        b"light" | b"theme-light" => Some(tauri::Theme::Light),
+        _ => None,
+    };
+
+    if let Some(theme) = theme
+        && let Some(window) = app.get_webview_window("main")
+    {
+        let _ = window.set_theme(Some(theme));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn start_linux_theme_monitor(
+    socket_path: std::path::PathBuf,
+) -> Option<std::process::Child> {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let mut child = std::process::Command::new("gsettings")
+        .args(["monitor", "org.gnome.desktop.interface", "color-scheme"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let command = if line.contains("prefer-dark") {
+                b"theme-dark".as_slice()
+            } else {
+                b"theme-light".as_slice()
+            };
+            send_linux_tray_command(&socket_path, command);
+        }
+    });
+
+    Some(child)
+}
+
+#[cfg(target_os = "linux")]
 fn start_linux_tray_command_listener(app: tauri::AppHandle) -> bool {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixDatagram;
@@ -671,6 +727,9 @@ fn start_linux_tray_command_listener(app: tauri::AppHandle) -> bool {
                     app.exit(0);
                     break;
                 }
+                b"theme-dark" | b"theme-light" => {
+                    set_linux_window_theme(&app, &command[..length]);
+                }
                 _ => {}
             }
         }
@@ -704,8 +763,18 @@ fn run_linux_elevated_with_tray() -> std::process::ExitCode {
     let exe_path = get_exe_path();
     let mut command = std::process::Command::new(exe_path);
     command.env("EASYTIER_GUI_TRAY_SOCKET", &socket_path);
+    command.env("EASYTIER_GUI_THEME", linux_desktop_theme());
 
-    if let Err(error) = elevate::Command::new(command).output() {
+    let mut theme_monitor = start_linux_theme_monitor(socket_path.clone());
+
+    let elevated_result = elevate::Command::new(command).output();
+
+    if let Some(monitor) = theme_monitor.as_mut() {
+        let _ = monitor.kill();
+        let _ = monitor.wait();
+    }
+
+    if let Err(error) = elevated_result {
         eprintln!("Failed to launch elevated EasyTier GUI: {error}");
         return std::process::ExitCode::FAILURE;
     }
@@ -1523,6 +1592,9 @@ pub fn run_gui() -> std::process::ExitCode {
 
             #[cfg(target_os = "linux")]
             {
+                if let Ok(theme) = std::env::var("EASYTIER_GUI_THEME") {
+                    set_linux_window_theme(app.handle(), theme.as_bytes());
+                }
                 let tray_available = start_linux_tray_command_listener(app.handle().clone());
                 LINUX_TRAY_AVAILABLE.store(tray_available, Ordering::Relaxed);
             }
