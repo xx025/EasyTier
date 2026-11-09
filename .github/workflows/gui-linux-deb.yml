@@ -1,0 +1,54 @@
+name: EasyTier GUI Linux Deb
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-musl
+  GUI_TARGET: x86_64-unknown-linux-gnu
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare build environment
+        uses: ./.github/actions/prepare-build
+        with:
+          target: ${{ env.TARGET }}
+          gui: true
+          pnpm: true
+          pnpm-build-filter: ''
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ''
+          shared-key: gui-linux-deb
+          cache-targets: false
+
+      - name: Build Debian package
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: ./easytier-gui
+          args: --verbose --target ${{ env.GUI_TARGET }} --bundles deb
+
+      - name: Upload Debian package
+        uses: actions/upload-artifact@v5
+        with:
+          name: easytier-gui-linux-x86_64-deb
+          path: ./target/${{ env.GUI_TARGET }}/release/bundle/deb/*.deb
+          if-no-files-found: error
